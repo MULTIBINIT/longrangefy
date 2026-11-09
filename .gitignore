@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Machine-local model and companion paper links
+/STO_full_dpmd.pb
+/papers/long_range_correction_atomic_potential

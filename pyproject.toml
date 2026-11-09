@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "longrangefy"
+version = "0.1.0"
+description = "Matched harmonic long-range corrections to existing interatomic potentials (ticket 01: reference harmonics)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]   # scipy: dipole/Ewald kernels (matched.py/dipole.py)
+
+[project.optional-dependencies]
+# Array core stays importable without either extra (R11).
+ase = ["ase>=3.23"]
+deepmd = ["deepmd-kit>=2.2.0", "ase>=3.23"]
+mace = ["mace-torch>=0.3.16", "ase>=3.23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
