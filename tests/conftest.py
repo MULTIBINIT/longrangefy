@@ -76,6 +76,18 @@ class AnharmonicModel(HarmonicModel):
         return quadratic + quartic
 
 
+def assert_reciprocal(blocks, atol: float = 1e-12) -> None:
+    """Assert the Hessian reciprocity ``Phi_R(i,a,j,b) = Phi_{-R}(j,b,i,a)^T``."""
+    index = {tuple(int(v) for v in r): i for i, r in enumerate(blocks.rpoints)}
+    mirror = np.asarray([
+        index[tuple(int(-r[k]) % int(blocks.reps[k]) for k in range(3))]
+        for r in blocks.rpoints])
+    np.testing.assert_allclose(
+        blocks.blocks,
+        blocks.blocks[mirror].transpose(0, 3, 4, 1, 2),
+        rtol=0, atol=atol)
+
+
 def random_blocks(rng: np.random.Generator, reps, n_uc: int) -> np.ndarray:
     """Translation-invariant physical blocks: Phi(i,R,j) = Phi(j,-R,i)^T.
 

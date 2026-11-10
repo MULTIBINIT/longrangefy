@@ -65,6 +65,7 @@ def _conventions(asr: str, stencil: str, displacement: float, ws_toldist: float)
         "image_weights": "ABINIT wght9 (brav=1) Wigner-Seitz boundary weights, folded into extended IFCs",
         "ws_toldist_angstrom2": float(ws_toldist),
         "asr": str(asr),
+        "asr_reciprocity": "symmetrized before ASR" if asr != "none" else "unmodified",
         "finite_difference_stencil": str(stencil),
         "finite_difference_displacement_angstrom": float(displacement),
     }

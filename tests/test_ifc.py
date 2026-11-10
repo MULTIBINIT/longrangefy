@@ -2,8 +2,8 @@
 
 import numpy as np
 import pytest
+from conftest import SKEW_CELL, SKEW_FRAC, assert_reciprocal, random_blocks
 
-from conftest import SKEW_CELL, SKEW_FRAC, random_blocks
 from longrangefy import (
     IfcMappingError,
     SupercellIFC,
@@ -242,11 +242,70 @@ def test_asr_conventions_zero_their_own_row_sums():
     # With unit folded weights both corrections coincide exactly.
     np.testing.assert_allclose(apply_asr_weighted(blocks, folded).blocks,
                                simple.blocks, atol=1e-12)
-    # ASR correction touches only the R = 0 self block.
-    changed = np.abs(simple.blocks - blocks.blocks).max(axis=(1, 2, 3, 4))
-    izero = int(np.argmin(np.abs(blocks.rpoints).sum(axis=1)))
-    assert changed[izero] > 0.0
-    np.testing.assert_allclose(np.delete(changed, izero), 0.0, atol=1e-15)
+
+
+def test_asr_simple_and_weighted_preserve_reciprocity_and_cartesian_zeros():
+    # random_blocks is reciprocal but not translation invariant; n_uc = 2 and
+    # reps = (2, 1, 3) make each row sum a full Cartesian 3x3 block per site.
+    blocks = make_blocks(seed=41, reps=(2, 1, 3))
+    assert blocks_asr_row_sums(blocks) > 1e-6
+
+    simple = apply_asr_simple(blocks)
+    assert_reciprocal(simple, atol=1e-10)
+    np.testing.assert_allclose(simple.blocks.sum(axis=(0, 3)), 0.0, atol=1e-10)
+    dense = blocks_to_dense(simple, simple.reps)
+    np.testing.assert_allclose(dense, dense.T, atol=1e-10)
+    q0 = blocks_to_qmatrices(simple)[0]
+    np.testing.assert_allclose(q0.sum(axis=2), 0.0, atol=1e-10)
+    np.testing.assert_allclose(q0, q0.conj().transpose(2, 3, 0, 1), atol=1e-10)
+
+    _, _, folded = weights_for(blocks)
+    # The WS cell is a fundamental domain, so actual folded weights are
+    # identically one; a reciprocal-symmetric radial modulation exercises the
+    # nonuniform weighted convention (nonuniform actual folded weights cannot
+    # occur).
+    np.testing.assert_allclose(folded, 1.0, atol=1e-10)
+    reps = np.asarray(blocks.reps)
+    mirror = np.asarray([
+        int(np.flatnonzero(np.all(blocks.rpoints == (-r) % reps, axis=1))[0])
+        for r in blocks.rpoints])
+    r2 = ((blocks.rpoints @ SKEW_CELL) ** 2).sum(axis=1)
+    radial = 1.0 + 0.25 * 0.5 * (r2 + r2[mirror]) / r2.max()
+    weights = folded * radial[None, None, :]
+    assert not np.allclose(weights, weights.flat[0])
+    assert blocks_asr_row_sums(blocks, weights) > 1e-6
+
+    weighted = apply_asr_weighted(blocks, weights)
+    assert_reciprocal(weighted, atol=1e-10)
+    residual = (weighted.blocks
+                * np.transpose(weights, (2, 0, 1))[:, :, None, :, None]
+                ).sum(axis=(0, 3))
+    np.testing.assert_allclose(residual, 0.0, atol=1e-10)
+    assert blocks_asr_row_sums(weighted, weights) < 1e-10
+
+    # The actual folded weights (uniform for this fixture) take the same path.
+    actual = apply_asr_weighted(blocks, folded)
+    assert_reciprocal(actual, atol=1e-10)
+    assert blocks_asr_row_sums(actual, folded) < 1e-10
+
+
+def test_asr_preserves_a_valid_hessian_and_rejects_incompatible_weights():
+    block = np.array([[2.0, 0.3, -0.2], [0.3, 1.5, 0.1], [-0.2, 0.1, 1.0]])
+    hessian = np.block([[block, -block], [-block, block]])
+    blocks = dense_to_blocks(hessian, (1, 1, 1))
+    np.testing.assert_allclose(blocks_to_dense(apply_asr_simple(blocks), blocks.reps),
+                               hessian, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(
+        blocks_to_dense(apply_asr_weighted(blocks, np.ones((2, 2, 1))), blocks.reps),
+        hessian, rtol=0, atol=1e-12)
+    weights = np.ones((2, 2, 1))
+    weights[0, 1, 0] = 2.0
+    with pytest.raises(IfcMappingError, match="reciprocal"):
+        apply_asr_weighted(blocks, weights)
+    weights[0, 1, 0] = 1e-15
+    weights[1, 0, 0] = 2e-15
+    with pytest.raises(IfcMappingError, match="reciprocal"):
+        apply_asr_weighted(blocks, weights)
 
 
 def test_shape_and_mismatch_validation():

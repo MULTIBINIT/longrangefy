@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-
 from conftest import (
     SKEW_CELL,
     SKEW_FRAC,
@@ -10,14 +9,20 @@ from conftest import (
     AnharmonicModel,
     HarmonicModel,
     _spring_hessian,
+    assert_reciprocal,
 )
+
 from longrangefy import (
     ElectricalResponse,
     ReferenceStructure,
     ResponseProvenance,
     SupercellMapping,
+    blocks_asr_row_sums,
+    blocks_to_qmatrices,
     build_reference_harmonics,
+    dense_to_blocks,
 )
+from longrangefy.matched import build_correction
 
 
 def make_reference():
@@ -142,8 +147,52 @@ def test_asr_weighted_workflow_zeroes_weighted_row_sums():
     harmonics = build_reference_harmonics(
         reference, make_response(), reps, model.get_forces,
         displacement=0.01, asr="weighted", force_noise_repeats=2)
-    from longrangefy import blocks_asr_row_sums
     assert blocks_asr_row_sums(harmonics.blocks, harmonics.folded_ws_weights) < 1e-10
+
+
+@pytest.mark.parametrize("asr", ["simple", "weighted"])
+def test_asr_workflow_preserves_reciprocity_and_cartesian_row_sums(asr):
+    reference = make_reference()
+    reps = (2, 1, 1)
+    rng = np.random.default_rng(26)
+    model = HarmonicModel(_spring_hessian(2 * reference.natom, rng),
+                          supercell_positions(reference, reps))
+    harmonics = build_reference_harmonics(
+        reference, make_response(), reps, model.get_forces,
+        displacement=0.01, asr=asr, force_noise_repeats=2)
+
+    # The raw matching-grid blocks are reciprocal but violate the sum rule.
+    raw = dense_to_blocks(harmonics.dense_hessian, reps)
+    assert_reciprocal(raw, atol=1e-10)
+    assert blocks_asr_row_sums(raw) > 1e-6
+
+    # The requested convention restores reciprocity and the full Cartesian
+    # acoustic residual, without disturbing the matching-grid contract.
+    assert_reciprocal(harmonics.blocks, atol=1e-10)
+    if asr == "weighted":
+        np.testing.assert_allclose(harmonics.folded_ws_weights, 1.0, atol=1e-10)
+        assert blocks_asr_row_sums(
+            harmonics.blocks, harmonics.folded_ws_weights) < 1e-10
+    np.testing.assert_allclose(harmonics.blocks.blocks.sum(axis=(0, 3)), 0.0,
+                               atol=1e-10)
+    q = harmonics.q_matrices
+    np.testing.assert_allclose(q, blocks_to_qmatrices(harmonics.blocks), atol=1e-12)
+    np.testing.assert_allclose(q[0].sum(axis=2), 0.0, atol=1e-10)
+    for qmatrix in q:
+        np.testing.assert_allclose(qmatrix, qmatrix.conj().transpose(2, 3, 0, 1),
+                                   atol=1e-10)
+    assert harmonics.conventions["asr"] == asr
+    assert harmonics.diagnostics["iq_on_grid_identity_max_abs_ev_per_angstrom2"] < 1e-8
+    correction = build_correction(
+        reference.cell, reference.cart_positions, harmonics.response.born_charges,
+        harmonics.response.dielectric, reps, q, harmonics.grid_h, (4, 1, 1),
+        nreal=2, nrecip=3)
+    rng = np.random.default_rng(27)
+    matching_pattern = rng.normal(size=3 * harmonics.natom_supercell, scale=0.01)
+    displacement = correction.matching_periodic_tiling(matching_pattern)
+    assert abs(correction.energy(displacement)) < 1e-10
+    assert np.abs(correction.forces(displacement)).max() < 1e-10
+    assert correction.diagnostics["shared_grid_max_branch_difference"] < 1e-10
 
 
 def test_validation_of_workflow_inputs():

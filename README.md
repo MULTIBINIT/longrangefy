@@ -16,6 +16,14 @@ rtk python -m pytest tests -q
 
 The NumPy/SciPy array core does not require ASE, DeepMD, pymultibinit or libabinit. Downstream pymultibinit integration is optional and has the opposite dependency direction.
 
+Reference harmonics default to `asr="none"`. Choosing `asr="simple"` or
+`asr="weighted"` explicitly symmetrizes the sampled IFCs and enforces the
+corresponding full Cartesian acoustic sum rule before either harmonic branch is
+built. This changes the sampled IFCs; the input finite-difference reciprocity
+residual remains available in the diagnostics. The weighted convention requires
+reciprocal site/image weights with nonzero support for each site pair; it is not
+interchangeable with the unweighted convention.
+
 ## DeepMD example
 
 Supply an eligible 3D-periodic insulating model, an explicit reference structure and matching repetitions, and separately sourced Born charges and electronic dielectric response. The example reads a JSON configuration whose `reference_file`, `response_file` and `response_provenance_file` are relative to the JSON file. The response NPZ contains `born_charges` and `dielectric`; the provenance JSON records the physical source, units and conducting Gamma boundary. The model path and a statement of its no-explicit-asymptotic-tail eligibility are required inputs. Force data alone cannot establish the electrical response or tail eligibility.

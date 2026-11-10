@@ -381,38 +381,68 @@ def blocks_asr_row_sums(blocks: SupercellIFC, ws_weights: np.ndarray | None = No
     return float(np.abs(weighted.sum(axis=(0, 3))).max())
 
 
-def apply_asr_weighted(
-    blocks: SupercellIFC,
-    ws_weights: np.ndarray,
-) -> SupercellIFC:
-    """Weighted acoustic sum rule onto the ``R = 0`` self block (ABINIT asr=1).
-
-    Adapted from pymultibinit ``pyeffpot/supercell_builder.py``
-    ``_apply_asr_weighted`` (user-authored code, reused with permission).
-    """
-    weights = np.asarray(ws_weights, dtype=float)
-    izero = int(np.argmin(np.abs(blocks.rpoints).sum(axis=1)))
-    if np.any(blocks.rpoints[izero] != 0):
-        raise IfcMappingError("R = 0 point not present in rpoints")
+def _apply_asr(blocks: SupercellIFC, weights: np.ndarray) -> SupercellIFC:
+    """Enforce reciprocity and the selected Cartesian sum rule together."""
     if weights.shape != (blocks.n_uc, blocks.n_uc, blocks.nrpt):
         raise IfcMappingError(
             f"ws_weights shape {weights.shape} does not match blocks "
             f"({blocks.n_uc}, {blocks.n_uc}, {blocks.nrpt})")
-    new_blocks = blocks.blocks.copy()
-    weighted = blocks.blocks * np.transpose(weights, (2, 0, 1))[:, :, None, :, None]
-    row_sums = weighted.sum(axis=(0, 3))                  # (n_uc, 3, 3)
+    if not np.isfinite(weights).all():
+        raise IfcMappingError("ASR weights must be finite")
+
+    reps = np.asarray(blocks.reps)
+    indices = {tuple(r % reps): i for i, r in enumerate(blocks.rpoints)}
+    if len(indices) != blocks.nrpt or (0, 0, 0) not in indices:
+        raise IfcMappingError("rpoints must contain each matching-grid class once")
+    inverse = np.array([indices[tuple((-r) % reps)] for r in blocks.rpoints])
+    if not np.allclose(weights, weights.transpose(1, 0, 2)[:, :, inverse],
+                       rtol=1e-12, atol=0):
+        raise IfcMappingError("ASR weights must respect reciprocal site/image pairs")
+
+    # The user-selected ASR also symmetrizes the sampled IFCs, before either
+    # branch is constructed. This avoids concealing mismatched branch data.
+    reciprocal = blocks.blocks[inverse].transpose(0, 3, 4, 1, 2)
+    new_blocks = 0.5 * (blocks.blocks + reciprocal)
+    row_sums = (new_blocks * weights.transpose(2, 0, 1)[:, :, None, :, None]
+                ).sum(axis=(0, 3))
+    symmetric = 0.5 * (row_sums + row_sums.transpose(0, 2, 1))
+    antisymmetric = -0.5 * (row_sums - row_sums.transpose(0, 2, 1))
+    izero = indices[(0, 0, 0)]
     for ia in range(blocks.n_uc):
-        new_blocks[izero, ia, :, ia, :] -= row_sums[ia]
-    return SupercellIFC(reps=blocks.reps, rpoints=blocks.rpoints, blocks=new_blocks)
+        self_weights = weights[ia, ia]
+        if self_weights[izero] != 0:
+            new_blocks[izero, ia, :, ia, :] -= symmetric[ia] / self_weights[izero]
+        else:
+            norm = self_weights @ self_weights
+            if norm == 0:
+                raise IfcMappingError("ASR requires nonzero weights for every self pair")
+            new_blocks[:, ia, :, ia, :] -= (
+                self_weights[:, None, None] * symmetric[ia] / norm)
+        for ib in range(ia + 1, blocks.n_uc):
+            pair_weights = weights[ia, ib]
+            norm = pair_weights @ pair_weights
+            if norm == 0:
+                raise IfcMappingError("ASR requires nonzero weights for every site pair")
+            transfer = (antisymmetric[ia] - antisymmetric[ib]) / blocks.n_uc
+            delta = pair_weights[:, None, None] * transfer / norm
+            new_blocks[:, ia, :, ib, :] += delta
+            new_blocks[inverse, ib, :, ia, :] += delta.transpose(0, 2, 1)
+    return SupercellIFC(reps=blocks.reps, rpoints=blocks.rpoints, blocks=new_blocks,
+                        units=blocks.units, order=blocks.order)
+
+
+def apply_asr_weighted(
+    blocks: SupercellIFC,
+    ws_weights: np.ndarray,
+) -> SupercellIFC:
+    """Enforce weighted Cartesian ASR and reciprocity on the matching grid.
+
+    Adapted from pymultibinit's weighted onsite ASR; reciprocal pair transfers
+    also remove the antisymmetric row residual.
+    """
+    return _apply_asr(blocks, np.asarray(ws_weights, dtype=float))
 
 
 def apply_asr_simple(blocks: SupercellIFC) -> SupercellIFC:
-    """Unweighted acoustic sum rule onto the ``R = 0`` self block."""
-    izero = int(np.argmin(np.abs(blocks.rpoints).sum(axis=1)))
-    if np.any(blocks.rpoints[izero] != 0):
-        raise IfcMappingError("R = 0 point not present in rpoints")
-    new_blocks = blocks.blocks.copy()
-    row_sums = blocks.blocks.sum(axis=(0, 3))             # (n_uc, 3, 3)
-    for ia in range(blocks.n_uc):
-        new_blocks[izero, ia, :, ia, :] -= row_sums[ia]
-    return SupercellIFC(reps=blocks.reps, rpoints=blocks.rpoints, blocks=new_blocks)
+    """Enforce unweighted Cartesian ASR and reciprocity on the matching grid."""
+    return _apply_asr(blocks, np.ones((blocks.n_uc, blocks.n_uc, blocks.nrpt)))
