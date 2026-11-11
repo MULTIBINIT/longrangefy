@@ -5,11 +5,22 @@ J. Chem. Phys. **156**, 124107 (2022), used through DeePMD-kit's
 ``dipole_charge`` modifier: Gaussian-smeared fixed charges (ions plus Wannier
 centroids) evaluated in reciprocal space under the tin-foil convention,
 
-    E_ele = 2 pi C/V sum_{k != 0, |k| <= k_max}
+    E_ele = 2 pi C/V sum_{k != 0 in the runtime grid}
                 exp(-k^2 / (4 beta^2)) / k^2 |S(k)|^2,
     S(k)  = sum_i q_i exp(-i k.r_i) + sum_n q_n exp(-i k.W_n),
 
-with ``C = e^2/(4 pi eps_0)``.  The tail response used here is the Hessian of
+with ``C = e^2/(4 pi eps_0)``.  The wavevector set is the one DeePMD-kit
+actually evaluates, not a sphere: ``EwaldRecp::cmpt_k`` in
+``source/lib/src/ewald.cc`` (DeePMD-kit 3.1.3) sets one even integer count per
+cell axis, ``K_d = 2 ceil(||a_d|| / (2 h))``, and sums every
+``m_d in [-K_d/2, K_d/2]`` with ``k = 2 pi m @ inv(cell).T``.  ``h`` is the
+declared ``ewald_h`` spacing; there is no separate runtime cutoff.  A
+spherical ``|k|`` cutoff is an approximation of this grid and is not the
+declared runtime tail (the previous implementation used one and was therefore
+not exact).  The op declares both numbers as TensorFlow ``float`` attributes,
+so the kernel evaluates ``float32(ewald_beta)`` and ``float32(ewald_h)``; the
+helper applies that rounding before it builds the grid or the weights.  The
+tail response used here is the Hessian of
 this functional *including the Wannier-centroid response*.  A DPLR centroid is
 predicted by the Deep Wannier network, so ``W = W(u)`` is not generally a
 stationary point of the tail energy and the exact Hessian needs both
@@ -36,7 +47,15 @@ and ``I_Q`` is the base package's sample-reproducing matching-grid interpolant
 normally and re-applies its own per-cell tail once; ``DeltaPhi_A`` carries the
 pointwise ``-E`` explicitly, so the long-range response is replaced rather
 than stacked.  On the matching grid ``DeltaPhi_A`` vanishes identically and
-every matching-periodic (tiled) pattern is preserved.
+every matching-periodic (tiled) pattern is preserved, but only if the target
+cell's runtime Ewald grid actually represents every matching mode.  The
+matching and target cells have independent per-axis rectangular runtime grids
+(fixed by ``ewald_h``), so a target grid can omit a matching alias even when
+the repetitions are compatible.  The builder therefore compares the full
+``3n x 3n`` folded existing-tail q-blocks at every shared matching/target
+wavevector (the componentwise gcd grid) against a bound scaled by the full raw
+operator and absolute folded sums.  A larger residual is rejected, never
+projected.
 
 The matching-cell fold is exact only for a translation-periodic response.
 The builder measures ``max|H - fold_unfold(H)|`` for the matching and target
@@ -106,8 +125,11 @@ __all__ = [
     "build_existing_tail_correction",
 ]
 
-#: e**2 / (4 pi eps_0), eV angstrom (CODATA 2018; same constant as dipole.py).
-_COULOMB = 14.3996454784255
+#: e**2 / (4 pi eps_0), eV angstrom, pinned to DeePMD-kit's runtime value
+#: (``ElectrostaticConvertion`` in ``source/lib/include/ewald.h``) so the
+#: declared tail is numerically the runtime operator.  ``dipole.py`` uses the
+#: CODATA 2018 value 14.3996454784255 (1.2e-9 relative difference).
+_COULOMB = 14.39964535475696995031
 #: Shape/metadata validation only; this is not a physical smoothing length.
 _DEFAULT_WANNIER_TRANSLATION_TOL = 1.0e-6
 #: Relative roundoff allowance for the exact matching/target fold/unfold identity.
@@ -168,6 +190,23 @@ def _is_tin_foil(value) -> bool:
     return text.startswith("tin-foil") or text.startswith("tin foil") or text == "conducting"
 
 
+def _runtime_attribute(value, name: str) -> float:
+    """Value the TensorFlow ``EwaldRecp`` op actually sees.
+
+    The op declares ``ewald_beta`` and ``ewald_h`` as TensorFlow ``float``
+    attributes; TensorFlow stores and passes them as float32 even though the
+    C++ kernel is compiled for double.  The runtime therefore evaluates
+    ``float32(beta)`` and ``float32(h)``.  Reproducing that rounding is
+    required for an exact comparison (an unrounded double differs by ~1e-7
+    relative in the energy and can move a grid count at a boundary).
+    """
+    number = _require_positive_float(value, name)
+    effective = float(np.float32(number))
+    if not np.isfinite(effective) or effective <= 0.0:
+        raise ExistingTailError(f"{name} is outside the float32 runtime range")
+    return effective
+
+
 def _validate_cell(cell, name: str) -> np.ndarray:
     arr = np.asarray(cell, dtype=float)
     if arr.shape != (3, 3) or not np.isfinite(arr).all():
@@ -188,33 +227,31 @@ def _validate_positions(positions, name: str, n: Optional[int] = None) -> np.nda
     return arr
 
 
-def _reciprocal_shells(cell: np.ndarray, k_max: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Integer shells with ``|k| <= k_max`` and their ``m G m = k^2/(4 pi^2)``.
+def _runtime_reciprocal_grid(cell: np.ndarray, ewald_h: float) -> tuple[np.ndarray, np.ndarray]:
+    """Integer reciprocal grid used by DeePMD-kit's ``EwaldRecp``.
 
-    ``k = m @ (2 pi inv(cell).T)``; a spherical cutoff is used so the declared
-    ``k_max`` has the same meaning as the design note's convergence study.
+    Exact transcription of ``cmpt_k`` in ``source/lib/src/ewald.cc``
+    (DeePMD-kit 3.1.3): per axis ``K_d = int(||a_d|| / h)``, rounded up until
+    ``K_d h >= ||a_d||`` and then up to the next even integer.  The reciprocal
+    sum runs over every ``m_d`` in ``[-K_d/2, K_d/2]``; the truncation is a
+    rectangular box in integer index space, not a sphere.  Returns the
+    nonzero indices and ``|m @ inv(cell).T|^2`` (the runtime's ``|rm|^2``,
+    i.e. ``(k/2 pi)^2``).
     """
-    reciprocal = 2.0 * np.pi * np.linalg.inv(cell).T
-    # |m @ reciprocal| >= sigma_min |m|, so this bound cannot miss a skew-cell
-    # cancellation that a per-basis-vector bound would.
-    sigma_min = float(np.linalg.svd(reciprocal, compute_uv=False).min())
-    if sigma_min <= 1e-12:
-        raise ExistingTailError("cell is too skew for the reciprocal shell enumeration")
-    nmax = int(np.ceil(k_max / sigma_min)) + 1
-    if nmax > 64:
-        raise ExistingTailError(
-            f"cell is too skew for the reciprocal shell enumeration at "
-            f"reciprocal_cutoff={k_max} (need {nmax} shells)")
-    axis = np.arange(-nmax, nmax + 1)
-    m = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
-    k = m @ reciprocal
-    kn = np.linalg.norm(k, axis=1)
-    keep = (kn <= k_max) & (kn > 1e-12)
-    if not np.any(keep):
-        raise ExistingTailError(
-            f"reciprocal_cutoff={k_max} selects no nonzero reciprocal vectors; "
-            "declare a cutoff consistent with the model")
-    return m[keep], (kn[keep] / (2.0 * np.pi)) ** 2
+    h = _runtime_attribute(ewald_h, "ewald_h")
+    counts = []
+    for length in np.linalg.norm(cell, axis=1):
+        count = int(length / h)
+        if count * h < length:
+            count += 1
+        if count % 2:
+            count += 1
+        counts.append(count)
+    axis = [np.arange(-count // 2, count // 2 + 1) for count in counts]
+    index = np.stack(np.meshgrid(*axis, indexing="ij"), axis=-1).reshape(-1, 3)
+    index = index[np.any(index != 0, axis=1)]
+    rm = index @ np.linalg.inv(cell).T
+    return index, np.einsum("ni,ni->n", rm, rm)
 
 
 # --------------------------------------------------------------------------
@@ -226,22 +263,22 @@ def gaussian_tail_energy(
     charges,
     *,
     ewald_beta: float,
-    reciprocal_cutoff: float,
+    ewald_h: float,
 ) -> float:
     """DPLR reciprocal Gaussian-charge energy for one periodic cell.
 
     ``positions`` are Cartesian (n, 3) row vectors; ``charges`` are the fixed
     declared charges in the same order.  The sum omits ``k = 0`` (tin foil)
-    and is truncated at the declared spherical ``reciprocal_cutoff`` (A^-1).
+    and runs over exactly the ``EwaldRecp`` runtime grid fixed by the declared
+    ``ewald_h`` (no spherical truncation).
     """
     cell = _validate_cell(cell, "cell")
     positions = _validate_positions(positions, "positions")
     charges = np.asarray(charges, dtype=float).reshape(-1)
     if charges.shape[0] != positions.shape[0] or not np.isfinite(charges).all():
         raise ExistingTailError("charges must be one finite value per position")
-    beta = _require_positive_float(ewald_beta, "ewald_beta")
-    cutoff = _require_positive_float(reciprocal_cutoff, "reciprocal_cutoff")
-    m, mgm = _reciprocal_shells(cell, cutoff)
+    beta = _runtime_attribute(ewald_beta, "ewald_beta")
+    m, mgm = _runtime_reciprocal_grid(cell, ewald_h)
     frac = positions @ np.linalg.inv(cell)
     structure = charges @ np.exp(-2j * np.pi * (frac @ m.T))
     weights = np.exp(-np.pi ** 2 * mgm / beta ** 2) / mgm
@@ -256,7 +293,7 @@ def gaussian_tail_gradient(
     charges,
     *,
     ewald_beta: float,
-    reciprocal_cutoff: float,
+    ewald_h: float,
 ) -> np.ndarray:
     """Cartesian gradient of :func:`gaussian_tail_energy` (eV/angstrom).
 
@@ -269,9 +306,8 @@ def gaussian_tail_gradient(
     charges = np.asarray(charges, dtype=float).reshape(-1)
     if charges.shape[0] != positions.shape[0] or not np.isfinite(charges).all():
         raise ExistingTailError("charges must be one finite value per position")
-    beta = _require_positive_float(ewald_beta, "ewald_beta")
-    cutoff = _require_positive_float(reciprocal_cutoff, "reciprocal_cutoff")
-    m, mgm = _reciprocal_shells(cell, cutoff)
+    beta = _runtime_attribute(ewald_beta, "ewald_beta")
+    m, mgm = _runtime_reciprocal_grid(cell, ewald_h)
     reciprocal = 2.0 * np.pi * np.linalg.inv(cell).T
     k = m @ reciprocal
     frac = positions @ np.linalg.inv(cell)
@@ -291,23 +327,23 @@ def gaussian_tail_hessian(
     charges,
     *,
     ewald_beta: float,
-    reciprocal_cutoff: float,
+    ewald_h: float,
 ) -> np.ndarray:
     """Exact Cartesian Hessian of :func:`gaussian_tail_energy`.
 
     Returns ``(3n, 3n)`` eV/Angstrom**2 in atom-major Cartesian order.  The
     translation-invariant kernel gives exact acoustic row sums: the diagonal
     block is the negative sum of the off-diagonal blocks, so uniform
-    translation of every charge is a no-op even for a truncated shell sum.
+    translation of every charge is a no-op even for the truncated runtime
+    grid.  The grid is the rectangular ``EwaldRecp`` set, never a sphere.
     """
     cell = _validate_cell(cell, "cell")
     positions = _validate_positions(positions, "positions")
     charges = np.asarray(charges, dtype=float).reshape(-1)
     if charges.shape[0] != positions.shape[0] or not np.isfinite(charges).all():
         raise ExistingTailError("charges must be one finite value per position")
-    beta = _require_positive_float(ewald_beta, "ewald_beta")
-    cutoff = _require_positive_float(reciprocal_cutoff, "reciprocal_cutoff")
-    m, mgm = _reciprocal_shells(cell, cutoff)
+    beta = _runtime_attribute(ewald_beta, "ewald_beta")
+    m, mgm = _runtime_reciprocal_grid(cell, ewald_h)
     frac = positions @ np.linalg.inv(cell)
     volume = abs(np.linalg.det(cell))
     weights = np.exp(-np.pi ** 2 * mgm / beta ** 2) / mgm
@@ -342,7 +378,10 @@ class DPLRTailDeclaration:
 
     All fields are required except the neutrality tolerance.  The declaration
     records the model/DW identity, the functional parameters, the charge maps,
-    the reference structure and the WC reference positions.  It does not
+    the reference structure and the WC reference positions.  ``ewald_beta``
+    and ``ewald_h`` are the runtime ``dipole_charge`` modifier parameters;
+    ``ewald_h`` alone fixes the exact ``EwaldRecp`` rectangular wavevector
+    grid (there is no independent runtime cutoff).  It does not
     accept a model without an explicit asymptotic tail: those models belong to
     the base fixed-cell workflow (``longrangefy.matched.build_correction``).
     Charge maps are copied into read-only mappings during validation, so
@@ -359,7 +398,6 @@ class DPLRTailDeclaration:
     modifier_type: str
     ewald_beta: float
     ewald_h: float
-    reciprocal_cutoff: float
     boundary_convention: str
     regime: str
     regime_evidence: str
@@ -403,9 +441,6 @@ class DPLRTailDeclaration:
                            _require_positive_float(self.ewald_beta, "ewald_beta"))
         object.__setattr__(self, "ewald_h",
                            _require_positive_float(self.ewald_h, "ewald_h"))
-        object.__setattr__(self, "reciprocal_cutoff",
-                           _require_positive_float(self.reciprocal_cutoff,
-                                                   "reciprocal_cutoff"))
         if not _is_tin_foil(self.boundary_convention):
             raise ExistingTailError(
                 "boundary_convention must declare tin-foil/conducting; the desired "
@@ -545,7 +580,6 @@ class DPLRTailDeclaration:
             "modifier_type": self.modifier_type,
             "ewald_beta": float(self.ewald_beta),
             "ewald_h": float(self.ewald_h),
-            "reciprocal_cutoff": float(self.reciprocal_cutoff),
             "boundary_convention": self.boundary_convention,
             "regime": self.regime,
             "regime_evidence": self.regime_evidence,
@@ -777,7 +811,7 @@ class DPLRTailHessian:
         return gaussian_tail_energy(
             cell, positions, charges,
             ewald_beta=self.declaration.ewald_beta,
-            reciprocal_cutoff=self.declaration.reciprocal_cutoff)
+            ewald_h=self.declaration.ewald_h)
 
     def gradient(
         self,
@@ -798,7 +832,7 @@ class DPLRTailHessian:
         grad = gaussian_tail_gradient(
             cell, positions, charges,
             ewald_beta=self.declaration.ewald_beta,
-            reciprocal_cutoff=self.declaration.reciprocal_cutoff)
+            ewald_h=self.declaration.ewald_h)
         n_ion = len(q_ion)
         return grad[:n_ion].copy(), grad[n_ion:].copy()
 
@@ -847,7 +881,11 @@ class DPLRTailHessian:
         joint = gaussian_tail_hessian(
             cell, positions, charges,
             ewald_beta=self.declaration.ewald_beta,
-            reciprocal_cutoff=self.declaration.reciprocal_cutoff)
+            ewald_h=self.declaration.ewald_h)
+        if report is not None:
+            grid, _ = _runtime_reciprocal_grid(cell, self.declaration.ewald_h)
+            report["reciprocal_grid_points"] = int(grid.shape[0])
+            report["ewald_h"] = float(self.declaration.ewald_h)
         n_ion, n_wc = len(q_ion), len(q_wc)
         k_ii = joint.reshape(n_ion + n_wc, 3, n_ion + n_wc, 3)[:n_ion, :, :n_ion, :]
         k_iw = joint.reshape(n_ion + n_wc, 3, n_ion + n_wc, 3)[:n_ion, :, n_ion:, :]
@@ -1088,6 +1126,42 @@ def _call_wannier_provider(
     return response
 
 
+def _shared_wavevector_preservation(
+    matching_q: np.ndarray,
+    target_q: np.ndarray,
+    matching_reps: Tuple[int, int, int],
+    target_reps: Tuple[int, int, int],
+) -> Tuple[float, Optional[Tuple[int, int, int]], int]:
+    """Largest raw existing-tail q-block mismatch on shared wavevectors.
+
+    ``matching_q`` and ``target_q`` are the full ``(nq, n, 3, n, 3)``
+    :func:`blocks_to_qmatrices` arrays of the folded matching and target
+    Hessians.  The componentwise gcd gives the shared sampling grid
+    ``q = k / g``; ``k`` maps to ``m = k * reps / g`` in each cell.  Every
+    shared wavevector is compared, including nonzero ones (a Gamma-only check
+    is insufficient when a target rectangular Ewald grid omits an alias).
+    """
+    reps_m = np.asarray(matching_reps, dtype=int)
+    reps_l = np.asarray(target_reps, dtype=int)
+    shared = np.gcd(reps_m, reps_l)
+    step_m = reps_m // shared
+    step_l = reps_l // shared
+    worst = 0.0
+    worst_index: Optional[Tuple[int, int, int]] = None
+    count = 0
+    for k in np.ndindex(tuple(int(v) for v in shared)):
+        m_index = np.asarray(k, dtype=int) * step_m
+        l_index = np.asarray(k, dtype=int) * step_l
+        m_flat = int((m_index[0] * reps_m[1] + m_index[1]) * reps_m[2] + m_index[2])
+        l_flat = int((l_index[0] * reps_l[1] + l_index[1]) * reps_l[2] + l_index[2])
+        residual = float(np.abs(matching_q[m_flat] - target_q[l_flat]).max())
+        if residual > worst:
+            worst = residual
+            worst_index = (int(k[0]), int(k[1]), int(k[2]))
+        count += 1
+    return worst, worst_index, count
+
+
 def build_existing_tail_correction(
     declaration: DPLRTailDeclaration,
     response: ElectricalResponse,
@@ -1130,6 +1204,17 @@ def build_existing_tail_correction(
     :func:`dense_to_blocks`.  There is no override: a non-periodic declared
     Wannier response cannot produce a matching-preserving Contract A
     correction.
+
+    The full existing-tail ``3n x 3n`` q-blocks must also agree at every
+    matching/target shared wavevector (componentwise gcd grid, ``q = k/g``),
+    with the roundoff bound scaled by the full raw operator and absolute
+    folded sums.  This catches a target runtime rectangular grid that omits a
+    matching alias (possible even for divisible repetitions because each cell
+    has its own ``ewald_h`` grid) and a Wannier response that is not the same
+    periodic response in both cells.  A mismatch is rejected; parameters are
+    not retuned and the response is not projected.  For divisible repetitions
+    this is equivalent to preserving every tiled matching-periodic pattern;
+    otherwise it enforces the shared-wavevector guarantee only.
 
     The returned correction is added exactly once to the unchanged original
     model, which must re-apply its own declared tail per cell.
@@ -1192,12 +1277,12 @@ def build_existing_tail_correction(
     # The fold is admissible only as a roundoff-level identity.  A
     # non-periodic Hessian is rejected, never silently projected.
     matching_blocks = dense_to_blocks(existing_matching, reps_m)
+    target_blocks = dense_to_blocks(existing_target, reps_l)
     matching_periodicity = float(np.abs(
         blocks_to_dense(matching_blocks, reps_m) - existing_matching).max())
     matching_scale = max(float(np.abs(existing_matching).max()), 1e-300)
     target_periodicity = float(np.abs(
-        blocks_to_dense(dense_to_blocks(existing_target, reps_l), reps_l)
-        - existing_target).max())
+        blocks_to_dense(target_blocks, reps_l) - existing_target).max())
     target_scale = max(float(np.abs(existing_target).max()), 1e-300)
     matching_limit = _PERIODICITY_ROUNDOFF * matching_scale
     target_limit = _PERIODICITY_ROUNDOFF * target_scale
@@ -1217,7 +1302,49 @@ def build_existing_tail_correction(
             "dense_to_blocks would silently average the non-periodic part; the "
             "declared Wannier response must be translation periodic over the "
             "target cell for Contract A to preserve matching-periodic patterns.")
-    existing_samples = blocks_to_qmatrices(matching_blocks)
+
+    # The per-cell runtime grids are independent rectangular boxes fixed by
+    # ewald_h, so a matching-grid mode can be absent from the target box even
+    # when the repetitions are compatible.  Compare the full 3n x 3n folded
+    # q-blocks at every shared wavevector; the bound is scaled by the full raw
+    # operator and absolute folded sums, never by a near-zero post-cancellation
+    # q-block.  The desired D branch is deliberately excluded from the scale:
+    # a larger D must not be able to hide an existing-tail mismatch.
+    matching_q = blocks_to_qmatrices(matching_blocks)
+    target_q = blocks_to_qmatrices(target_blocks)
+    preservation_residual, preservation_index, preservation_count = \
+        _shared_wavevector_preservation(matching_q, target_q, reps_m, reps_l)
+    folded_scale = max(
+        float(np.abs(matching_blocks.blocks).sum(axis=0).max()),
+        float(np.abs(target_blocks.blocks).sum(axis=0).max()),
+        float(np.abs(existing_matching).max()),
+        float(np.abs(existing_target).max()),
+        1e-300,
+    )
+    preservation_limit = _PERIODICITY_ROUNDOFF * folded_scale
+    shared = np.gcd(np.asarray(reps_m, dtype=int), np.asarray(reps_l, dtype=int))
+    q_frac = np.asarray(
+        preservation_index if preservation_index is not None else (0, 0, 0), dtype=float
+    ) / shared
+    q_text = "(" + ", ".join(f"{value:.6g}" for value in q_frac) + ")"
+    matching_points = int(matching_report.get("reciprocal_grid_points", 0))
+    target_points = int(target_report.get("reciprocal_grid_points", 0))
+    if preservation_residual > preservation_limit:
+        raise ExistingTailError(
+            "existing-tail response is not preserved on a shared matching/target "
+            f"wavevector: max|E_L(q) - E_M(q)| = {preservation_residual:.3e} "
+            f"eV/angstrom**2 at q = {q_text} exceeds the roundoff bound "
+            f"{preservation_limit:.3e} eV/angstrom**2 (full raw operator scale "
+            f"{folded_scale:.3e}).  DeePMD-kit EwaldRecp uses independent per-axis "
+            f"rectangular grids fixed by ewald_h ({matching_points} matching points, "
+            f"{target_points} target points); at this shared wavevector the target grid "
+            "can omit a "
+            "matching-grid alias, or the declared Wannier response can differ between "
+            "the two cells.  Contract A would silently violate matching-periodic "
+            "preservation.  No declared parameter is retuned and no response is "
+            "projected: choose matching/target repetitions whose native runtime grids "
+            "represent the required shared modes, or a declared ewald_h whose grids do.")
+    existing_samples = matching_q
     grid_h = _grid_h(reps_m)
     q_match = grid_h.astype(float) / np.asarray(reps_m, dtype=float)
     desired_samples = np.stack([
@@ -1279,7 +1406,20 @@ def build_existing_tail_correction(
         "wc_gradient_max_abs_target": float(
             target_report.get("wc_gradient_max_abs", 0.0)),
         "ewald_eta": shared_eta,
+        "existing_tail_ewald_h": float(declaration.ewald_h),
+        "existing_tail_ewald_h_runtime_float32": _runtime_attribute(
+            declaration.ewald_h, "ewald_h"),
+        "existing_tail_ewald_beta_runtime_float32": _runtime_attribute(
+            declaration.ewald_beta, "ewald_beta"),
+        "existing_tail_grid_points_matching": int(
+            matching_report.get("reciprocal_grid_points", 0)),
+        "existing_tail_grid_points_target": int(
+            target_report.get("reciprocal_grid_points", 0)),
         "matching_grid_points": int(np.prod(reps_m)),
+        "matching_preservation_residual": preservation_residual,
+        "matching_preservation_scale": folded_scale,
+        "matching_preservation_limit": preservation_limit,
+        "matching_preservation_shared_wavevectors": int(preservation_count),
         "matching_periodicity_residual": matching_periodicity,
         "matching_periodicity_scale": matching_scale,
         "matching_periodicity_limit": matching_limit,
@@ -1296,6 +1436,8 @@ def build_existing_tail_correction(
             np.abs(correction @ tiled_pattern).max())
 
     metadata = {
+        # CorrectedCalculator maps target atoms back to these reference labels.
+        "species": list(declaration.reference_species),
         "units": "angstrom, eV (whole cell), eV/angstrom, eV/angstrom**2",
         "ifc_axes": "(i, mu, j, nu) atom-major Cartesian, unmassweighted",
         "site_order": desired_carrier.metadata.get("site_order"),
@@ -1303,10 +1445,21 @@ def build_existing_tail_correction(
         "boundary": "tin-foil (conducting); shared by the DPLR tail and desired response",
         "contract": "A: DeltaPhi = (D_L - E_L) - I_Q[D - E]_L",
         "interpolation": desired_carrier.metadata.get("interpolation"),
+        "existing_tail_grid": {
+            "convention": (
+                "DeePMD-kit EwaldRecp cmpt_k: K_d = 2 ceil(||a_d||/(2 h)); "
+                "m_d in [-K_d/2, K_d/2] on every axis (rectangular, not spherical)"),
+            "ewald_h": float(declaration.ewald_h),
+            "ewald_h_runtime_float32": _runtime_attribute(
+                declaration.ewald_h, "ewald_h"),
+            "spherical_truncation": False,
+        },
         "ewald": {
             "eta": shared_eta,
             "nreal": int(nreal),
             "nrecip": int(nrecip),
+            "beta_runtime_float32": _runtime_attribute(
+                declaration.ewald_beta, "ewald_beta"),
             "neutrality_tolerance": float(response.neutrality_tolerance),
         },
         "existing_tail": declaration.to_dict(),
@@ -1319,6 +1472,19 @@ def build_existing_tail_correction(
             "matching_limit": matching_limit,
             "target_residual": target_periodicity,
             "target_limit": target_limit,
+        },
+        "preservation": {
+            "shared_wavevector_checked": True,
+            "shared_wavevector_count": int(preservation_count),
+            "shared_wavevector_residual": preservation_residual,
+            "shared_wavevector_limit": preservation_limit,
+            "shared_wavevector_scale": folded_scale,
+            "worst_shared_q": q_frac.tolist(),
+            "tiled_compatible": bool(np.all(
+                np.asarray(reps_l, dtype=int) % np.asarray(reps_m, dtype=int) == 0)),
+            "note": (
+                "full 3n x 3n existing-tail q-blocks compared at every shared "
+                "matching/target wavevector (componentwise gcd grid); no projection"),
         },
         "wannier_response": {
             "matching": {

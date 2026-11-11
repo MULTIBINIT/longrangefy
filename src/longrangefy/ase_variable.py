@@ -40,12 +40,10 @@ as a diagnostic.  The adapter passes its per-site displacement bound into the
 core evaluation, so a bounded state in which an atom lies within the bound of
 two deformed reference sites, or an assigned site has more than one periodic
 image inside the bound, is rejected instead of silently re-assigned.
-No production supported strain range is asserted (approved decision D4:
-derive it from real-workflow validation).  ``max_abs_strain`` is an optional
-caller-declared validation bound; the finite-strain checks here are synthetic
-construction tests, not a material-accuracy or NPT claim.  A real DeepMD run,
-Ewald convergence study, and finite-strain validation must be performed before
-advertising relaxation or NPT workflows.
+No general material strain range is asserted. ``max_abs_strain`` is an
+optional caller-declared validation bound. The README records specific
+finite-strain and relaxation checks on a SrTiO3 DeepMD model; they do not
+establish general material accuracy or NPT support.
 """
 
 from __future__ import annotations

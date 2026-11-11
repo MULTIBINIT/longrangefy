@@ -1,15 +1,18 @@
 """Ticket 11 behaviour tests: declared DPLR existing-tail replacement (Contract A).
 
 Scope: the independent array core in :mod:`longrangefy.existing_tail` plus the
-base :mod:`longrangefy.matched` interpolation/correction machinery.  Nothing
-here imports ASE or DeepMD except the optional runtime cross-check, which is
-skipped when the TensorFlow DPLR runtime is absent.  The fixtures are
+base :mod:`longrangefy.matched` interpolation/correction machinery.  ASE and
+DeepMD are optional imports inside the composition and runtime cross-checks;
+those tests skip when the corresponding package is absent.  The fixtures are
 synthetic declared DPLR tails; they are not a production NaCl model and imply
 nothing about model accuracy.
 
 The tests assert the identities the design note predeclares:
-* the DPLR functional and its exact Hessian (energy/force finite differences,
-  symmetry, acoustic sum rule, translation invariance);
+* the DPLR functional uses the exact DeePMD-kit ``EwaldRecp`` rectangular
+  wavevector grid fixed by ``ewald_h`` (including its float32 op attributes),
+  and its energy, force and Hessian match the runtime on orthogonal, skew and
+  deliberately non-converged coarse grids, with symmetry, acoustic sum rule and
+  translation invariance;
 * the full ionic + Wannier-centroid response including the curvature
   ``d^2W/du^2`` gradient contraction (a frozen or first-order-only centroid is
   rejected and is demonstrably a different Hessian);
@@ -19,6 +22,12 @@ The tests assert the identities the design note predeclares:
 * the fold/unfold periodicity identity for the existing Hessian, with a
   non-periodic Wannier response rejected beyond numerical roundoff (there is
   no tolerance override that would permit a nonpreserving matching cell);
+* full existing-tail q-block preservation at every shared matching/target
+  wavevector, including nonzero q and non-divisible repetitions; a target
+  runtime grid that omits a matching alias is rejected, not projected;
+* consumer-visible ASE composition through ``CorrectedCalculator`` adds the
+  correction exactly once and the correction metadata carries the reference
+  species;
 * metadata rejection, missing/partial response rejection, immutable copied
   charge maps and the unchanged base no-tail workflow.
 
@@ -78,7 +87,6 @@ def _declaration(**overrides) -> DPLRTailDeclaration:
         modifier_type="dipole_charge",
         ewald_beta=0.4,
         ewald_h=1.0,
-        reciprocal_cutoff=6.0,
         boundary_convention="tin-foil (conducting)",
         regime="per-cell",
         regime_evidence=(
@@ -167,6 +175,40 @@ def _provider(weight: float = 0.0, curvature: float = 0.0,
     return provider
 
 
+def _local_provider(natom: int = 2, kappa: float = 0.03):
+    """Translation-periodic WC response with a cell-local curvature term.
+
+    Each centroid keeps its parent image and couples quadratically along x to
+    the next site in the same primitive image.  Unlike ``_provider`` with
+    ``curvature_all``, tiling the cell repeats exactly this response, so the
+    matching and target existing Hessians describe the same periodic physics.
+    """
+
+    def provider(cell, ion_positions, ion_species, wannier_positions, wannier_parents):
+        n_ion = len(ion_positions)
+        n_wc = len(wannier_positions)
+        jacobian = np.zeros((n_wc, 3, n_ion, 3))
+        second = np.zeros((n_wc, 3, n_ion, 3, n_ion, 3))
+        for wc, parent in enumerate(wannier_parents):
+            parent = int(parent)
+            jacobian[wc, :, parent, :] = np.eye(3)
+            partner = (parent // natom) * natom + ((parent % natom) + 1) % natom
+            if partner == parent:
+                continue
+            second[wc, 0, parent, 0, parent, 0] += 0.5 * kappa
+            second[wc, 0, partner, 0, partner, 0] += 0.5 * kappa
+            second[wc, 0, parent, 0, partner, 0] -= 0.5 * kappa
+            second[wc, 0, partner, 0, parent, 0] -= 0.5 * kappa
+        return WannierResponse(
+            jacobian=jacobian,
+            second_derivative=second,
+            provenance="synthetic test provider (deterministic local response)",
+            method="linearised WC response plus cell-local relative-coordinate curvature",
+        )
+
+    return provider
+
+
 def _build(declaration=None, response=None, matching=(2, 1, 1), target=(4, 1, 1),
            provider=None, **kwargs):
     return build_existing_tail_correction(
@@ -193,11 +235,15 @@ def _tiled_geometry(declaration, reps):
 # --------------------------------------------------------------------------
 # declared DPLR functional and Hessian
 # --------------------------------------------------------------------------
-def test_tail_energy_matches_deepmd_runtime_box_convention():
-    """Cross-check the declared functional against DeePMD-kit's EwaldRecp.
+def test_tail_energy_and_force_match_deepmd_runtime_rectangular_grid():
+    """Cross-check energy and force against DeePMD-kit's ``EwaldRecp``.
 
     The runtime box is row-major in this package's row-vector cell convention;
-    the skew case is included so a silent transpose cannot pass.
+    the skew case is included so a silent transpose cannot pass.  The coarse
+    ``(h=2.5, beta=0.6)`` case is deliberately non-converged: the declared
+    tail must reproduce the runtime's actual box grid, not a converged
+    spherical sum.  Non-float32-exact parameters also pin the op attribute
+    rounding.
     """
     pytest.importorskip("tensorflow")
     ewald_recp = pytest.importorskip("deepmd.tf.infer.ewald_recp")
@@ -207,15 +253,78 @@ def test_tail_energy_matches_deepmd_runtime_box_convention():
     ]
     frac = np.array([[0.0, 0.0, 0.0], [0.31, 0.52, 0.19], [0.72, 0.18, 0.61]])
     charges = np.array([1.0, -1.3, 0.3])
-    beta = 0.45
-    runtime = ewald_recp.EwaldRecp(0.5, beta)
+    cases = ((0.5, 0.45), (1.3, 0.7), (2.5, 0.6))
     for cell in cells:
         positions = frac @ cell
-        ours = gaussian_tail_energy(
-            cell, positions, charges, ewald_beta=beta, reciprocal_cutoff=4.0)
-        reference = runtime.eval(
-            positions.reshape(1, -1), charges.reshape(1, -1), cell.reshape(1, -1))[0][0]
-        assert_allclose(ours, reference, rtol=1e-6, atol=1e-8)
+        for h, beta in cases:
+            runtime = ewald_recp.EwaldRecp(h, beta)
+            reference_energy, reference_force, _ = runtime.eval(
+                positions.reshape(1, -1), charges.reshape(1, -1), cell.reshape(1, -1))
+            ours_energy = gaussian_tail_energy(
+                cell, positions, charges, ewald_beta=beta, ewald_h=h)
+            ours_force = -gaussian_tail_gradient(
+                cell, positions, charges, ewald_beta=beta, ewald_h=h)
+            assert_allclose(ours_energy, float(reference_energy[0]),
+                            rtol=1e-12, atol=1e-13)
+            assert_allclose(ours_force.reshape(-1), reference_force[0],
+                            rtol=1e-11, atol=1e-12)
+
+
+def test_tail_grid_is_the_runtime_rectangular_box_not_a_sphere():
+    """A box sum and a spherical sum differ by far more than roundoff.
+
+    Also pins the float32 rounding of the TensorFlow op attributes: a declared
+    ``ewald_h`` just below 2 A evaluates with the runtime's ``float32(2 A)``
+    grid, which has a different number of boxes than the exact-double grid.
+    """
+    cell = np.diag([4.0, 4.0, 4.0])
+    positions = np.array([[0.0, 0.0, 0.0], [1.3, 2.1, 0.7]])
+    charges = np.array([1.0, -1.0])
+    h, beta = 2.0, 0.75
+    index = np.stack(
+        np.meshgrid(*[np.arange(-1, 2)] * 3, indexing="ij"), axis=-1).reshape(-1, 3)
+    index = index[np.any(index != 0, axis=1)]
+    rm = index @ np.linalg.inv(cell).T
+    mgm = np.einsum("ni,ni->n", rm, rm)
+    structure = charges @ np.exp(
+        -2j * np.pi * ((positions @ np.linalg.inv(cell)) @ index.T))
+    weights = np.exp(-np.pi ** 2 * mgm / beta ** 2) / mgm
+    prefactor = 14.39964535475696995031 / (2.0 * np.pi * abs(np.linalg.det(cell)))
+    contributions = prefactor * weights * np.abs(structure) ** 2
+    box = contributions.sum()
+    sphere = contributions[
+        np.linalg.norm(rm, axis=1) * 2.0 * np.pi <= 2.0].sum()
+    assert abs(box - sphere) > 0.1
+
+    assert_allclose(gaussian_tail_energy(
+        cell, positions, charges, ewald_beta=beta, ewald_h=h),
+        box, rtol=1e-12, atol=1e-13)
+
+    pytest.importorskip("tensorflow")
+    ewald_recp = pytest.importorskip("deepmd.tf.infer.ewald_recp")
+    reference = ewald_recp.EwaldRecp(h, beta).eval(
+        positions.reshape(1, -1), charges.reshape(1, -1), cell.reshape(1, -1))
+    assert_allclose(gaussian_tail_energy(
+        cell, positions, charges, ewald_beta=beta, ewald_h=h),
+        float(reference[0][0]), rtol=1e-12, atol=1e-13)
+    assert_allclose(-gaussian_tail_gradient(
+        cell, positions, charges, ewald_beta=beta, ewald_h=h).reshape(-1),
+        reference[1][0], rtol=1e-11, atol=1e-12)
+
+    # 1.99999995 is > 4/2 in double but rounds to exactly 2.0 in float32, so
+    # the runtime uses K=2 (26 vectors), not K=4 (124).  The declared operator
+    # must use the runtime value.
+    declared_h = 1.99999995
+    assert float(np.float32(declared_h)) == 2.0
+    runtime = ewald_recp.EwaldRecp(declared_h, 0.45)
+    reference = runtime.eval(
+        positions.reshape(1, -1), charges.reshape(1, -1), cell.reshape(1, -1))
+    assert_allclose(gaussian_tail_energy(
+        cell, positions, charges, ewald_beta=0.45, ewald_h=declared_h),
+        float(reference[0][0]), rtol=1e-12, atol=1e-13)
+    assert_allclose(-gaussian_tail_gradient(
+        cell, positions, charges, ewald_beta=0.45, ewald_h=declared_h).reshape(-1),
+        reference[1][0], rtol=1e-11, atol=1e-12)
 
 
 def test_tail_hessian_matches_energy_finite_differences_and_invariants():
@@ -224,10 +333,10 @@ def test_tail_hessian_matches_energy_finite_differences_and_invariants():
     cell = np.array([[4.0, 0.3, 0.0], [0.0, 3.7, 0.2], [0.1, 0.0, 4.2]])
     frac = np.array([[0.0, 0.0, 0.0], [0.31, 0.52, 0.19], [0.72, 0.18, 0.61]])
     charges = np.array([1.0, -1.3, 0.3])
-    beta, cutoff = 0.45, 4.0
+    beta = 0.45
     positions = frac @ cell
     hessian = gaussian_tail_hessian(
-        cell, positions, charges, ewald_beta=beta, reciprocal_cutoff=cutoff)
+        cell, positions, charges, ewald_beta=beta, ewald_h=0.5)
 
     assert hessian.shape == (9, 9)
     assert_allclose(hessian, hessian.T, atol=1e-10)
@@ -240,7 +349,7 @@ def test_tail_hessian_matches_energy_finite_differences_and_invariants():
 
     def energy(r):
         return gaussian_tail_energy(
-            cell, r, charges, ewald_beta=beta, reciprocal_cutoff=cutoff)
+            cell, r, charges, ewald_beta=beta, ewald_h=0.5)
 
     for a in range(3):
         for mu in range(3):
@@ -266,19 +375,19 @@ def test_tail_hessian_matches_energy_finite_differences_and_invariants():
     # therefore leaves the Hessian unchanged.
     shifted = gaussian_tail_hessian(
         cell, positions + np.array([0.123, -0.045, 0.067]), charges,
-        ewald_beta=beta, reciprocal_cutoff=cutoff)
+        ewald_beta=beta, ewald_h=0.5)
     assert_allclose(shifted, hessian, atol=1e-10)
 
 
-def test_tail_cutoff_convergence():
+def test_tail_grid_refinement_converges():
     cell = np.diag([4.0, 4.0, 4.0])
     frac = np.array([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]])
     positions = frac @ cell
     charges = np.array([1.0, -1.0])
     coarse = gaussian_tail_hessian(
-        cell, positions, charges, ewald_beta=0.4, reciprocal_cutoff=4.0)
+        cell, positions, charges, ewald_beta=0.4, ewald_h=0.5)
     fine = gaussian_tail_hessian(
-        cell, positions, charges, ewald_beta=0.4, reciprocal_cutoff=6.0)
+        cell, positions, charges, ewald_beta=0.4, ewald_h=0.25)
     assert_allclose(coarse, fine, rtol=1e-6, atol=1e-5)
 
 
@@ -288,21 +397,21 @@ def test_tail_input_validation():
     charges = np.array([1.0, -1.0])
     with pytest.raises(ExistingTailError, match="one finite value per position"):
         gaussian_tail_energy(cell, positions, charges[:-1],
-                             ewald_beta=0.4, reciprocal_cutoff=4.0)
+                             ewald_beta=0.4, ewald_h=0.5)
     with pytest.raises(ExistingTailError, match="ewald_beta"):
         gaussian_tail_energy(cell, positions, charges,
-                             ewald_beta=0.0, reciprocal_cutoff=4.0)
-    with pytest.raises(ExistingTailError, match="selects no"):
+                             ewald_beta=0.0, ewald_h=0.5)
+    with pytest.raises(ExistingTailError, match="ewald_h"):
         gaussian_tail_energy(cell, positions, charges,
-                             ewald_beta=0.4, reciprocal_cutoff=1e-9)
+                             ewald_beta=0.4, ewald_h=0.0)
     with pytest.raises(ExistingTailError, match="nonsingular"):
         gaussian_tail_energy(np.zeros((3, 3)), positions, charges,
-                             ewald_beta=0.4, reciprocal_cutoff=4.0)
+                             ewald_beta=0.4, ewald_h=0.5)
     bad = positions.copy()
     bad[0, 0] = np.nan
     with pytest.raises(ExistingTailError, match="finite"):
         gaussian_tail_energy(cell, bad, charges,
-                             ewald_beta=0.4, reciprocal_cutoff=4.0)
+                             ewald_beta=0.4, ewald_h=0.5)
 
 
 # --------------------------------------------------------------------------
@@ -349,7 +458,6 @@ def test_declaration_charge_maps_are_immutable_and_copied():
     (dict(periodic_insulator=False), "periodic_insulator"),
     (dict(ewald_beta=0.0), "ewald_beta"),
     (dict(ewald_h=0.0), "ewald_h"),
-    (dict(reciprocal_cutoff=0.0), "reciprocal_cutoff"),
     (dict(model_sha256="not-a-sha"), "SHA-256"),
     (dict(sys_charge_map={"Na": 1.0}), "sys_charge_map"),
     (dict(model_charge_map={"Na": -1.0}), "model_charge_map"),
@@ -431,7 +539,7 @@ def test_tail_hessian_uses_full_wannier_chain_rule():
     frozen = gaussian_tail_hessian(
         cell, ions, q_ion,
         ewald_beta=declaration.ewald_beta,
-        reciprocal_cutoff=declaration.reciprocal_cutoff)
+        ewald_h=declaration.ewald_h)
     assert np.max(np.abs(hessian - frozen)) > 1e-3
 
     # A predicted centroid is not generally stationary: the gradient
@@ -481,9 +589,9 @@ def test_tail_gradient_matches_energy_finite_differences():
     frac = np.array([[0.0, 0.0, 0.0], [0.31, 0.52, 0.19], [0.72, 0.18, 0.61]])
     charges = np.array([1.0, -1.3, 0.3])
     positions = frac @ cell
-    beta, cutoff = 0.45, 4.0
+    beta = 0.45
     gradient = gaussian_tail_gradient(
-        cell, positions, charges, ewald_beta=beta, reciprocal_cutoff=cutoff)
+        cell, positions, charges, ewald_beta=beta, ewald_h=0.5)
     step = 1e-6
     finite = np.zeros_like(gradient)
     for a in range(3):
@@ -494,9 +602,9 @@ def test_tail_gradient_matches_energy_finite_differences():
             minus[a, mu] -= step
             finite[a, mu] = (
                 gaussian_tail_energy(
-                    cell, plus, charges, ewald_beta=beta, reciprocal_cutoff=cutoff)
+                    cell, plus, charges, ewald_beta=beta, ewald_h=0.5)
                 - gaussian_tail_energy(
-                    cell, minus, charges, ewald_beta=beta, reciprocal_cutoff=cutoff)
+                    cell, minus, charges, ewald_beta=beta, ewald_h=0.5)
             ) / (2.0 * step)
     assert_allclose(gradient, finite, rtol=1e-6, atol=1e-7)
     assert_allclose(gradient.sum(axis=0), 0.0, atol=1e-10)
@@ -616,6 +724,49 @@ def test_contract_a_energy_force_consistency_and_site_mapping():
     assert_allclose(mapped_forces, forces, atol=1e-12)
 
 
+def test_contract_a_metadata_supports_ase_composition_exactly_once():
+    """Consumer-visible composition: metadata species, energy, forces, once."""
+    pytest.importorskip("ase")
+    from ase import Atoms
+    from ase.calculators.lj import LennardJones
+
+    from longrangefy.ase_correction import CorrectedCalculator
+
+    correction = _build(matching=(1, 1, 1), target=(2, 1, 1))
+    assert np.max(np.abs(correction.correction_matrix)) > 1e-6
+
+    cell, positions, species = _tiled_geometry(_declaration(), correction.target_reps)
+    reference = Atoms(symbols=list(species), positions=positions, cell=cell, pbc=True)
+    atoms = reference.copy()
+    atoms.calc = CorrectedCalculator(
+        LennardJones(), correction, reference, max_displacement=0.3)
+    atoms.positions[0, 0] += 0.1
+
+    plain = atoms.copy()
+    plain.calc = LennardJones()
+    original_energy = plain.get_potential_energy(apply_constraint=False)
+    original_forces = plain.get_forces(apply_constraint=False)
+
+    mapping = correction.map_sites(cell, positions, list(species))
+    displacement = (atoms.positions - positions).reshape(-1)
+    correction_energy, correction_forces = correction.evaluate(displacement, mapping)
+
+    assert_allclose(atoms.get_potential_energy(),
+                    original_energy + correction_energy, atol=1e-10)
+    assert_allclose(atoms.get_forces(),
+                    original_forces + correction_forces.reshape(-1, 3), atol=1e-10)
+    assert abs(correction_energy) > 1e-8
+
+    step = 1e-5
+    atoms.positions[0, 0] += step
+    plus = atoms.get_potential_energy()
+    atoms.positions[0, 0] -= 2 * step
+    minus = atoms.get_potential_energy()
+    atoms.positions[0, 0] += step
+    assert_allclose(atoms.get_forces()[0, 0], -(plus - minus) / (2 * step),
+                    atol=1e-8, rtol=1e-6)
+
+
 def test_contract_a_dynamical_response_and_desired_asymptote():
     correction = _build()
     q0 = np.zeros(3)
@@ -686,8 +837,62 @@ def test_fourier_sign_convention_is_consistent():
 def test_incompatible_target_does_not_claim_tiled_preservation():
     correction = _build(matching=(2, 1, 1), target=(3, 1, 1))
     assert correction.tiled_compatible() is False
+    preservation = correction.metadata["preservation"]
+    assert preservation["shared_wavevector_checked"] is True
+    assert preservation["tiled_compatible"] is False
+    assert preservation["shared_wavevector_residual"] <= \
+        preservation["shared_wavevector_limit"]
     with pytest.raises(ValueError, match="not multiples"):
         correction.matching_periodic_tiling(np.zeros(6))
+
+
+def test_runtime_grid_mismatch_is_rejected_not_projected():
+    # a=4 A, h=1.3: matching K=(8,4,4) has a mode the target K=(14,4,4)
+    # cannot fold; the full q-block check catches it before assembly.
+    with pytest.raises(ExistingTailError, match="shared matching/target wavevector"):
+        _build(
+            declaration=_declaration(ewald_beta=2.0, ewald_h=1.3),
+            matching=(2, 1, 1), target=(4, 1, 1),
+            provider=_local_provider())
+
+
+def test_compatible_runtime_grid_preserves_tiled_patterns():
+    correction = _build(
+        declaration=_declaration(ewald_beta=2.0, ewald_h=2.0),
+        matching=(2, 1, 1), target=(4, 1, 1),
+        provider=_local_provider())
+    preservation = correction.metadata["preservation"]
+    assert preservation["tiled_compatible"] is True
+    assert preservation["shared_wavevector_checked"] is True
+    assert preservation["shared_wavevector_count"] == 2
+    assert preservation["shared_wavevector_residual"] <= \
+        preservation["shared_wavevector_limit"]
+    assert correction.diagnostics["wannier_second_derivative_max_abs_matching"] > 0.0
+    pattern = np.linspace(0.011, 0.023, 3 * 2)
+    tiled = correction.matching_periodic_tiling(pattern)
+    assert_allclose(correction.correction_matrix @ tiled, 0.0, atol=1e-7)
+
+
+def test_shared_wavevector_check_covers_nonzero_q():
+    # M=(4,1,1), L=(6,1,1): shared q are Gamma and (1/2, 0, 0).  h=4
+    # represents both; h=6 keeps Gamma exact but drops the 1/2 mode in the
+    # target grid, which must be rejected.
+    accepted = _build(
+        declaration=_declaration(ewald_beta=2.0, ewald_h=4.0),
+        matching=(4, 1, 1), target=(6, 1, 1),
+        provider=_local_provider())
+    preservation = accepted.metadata["preservation"]
+    assert preservation["tiled_compatible"] is False
+    assert preservation["shared_wavevector_count"] == 2
+    assert preservation["shared_wavevector_residual"] <= \
+        preservation["shared_wavevector_limit"]
+
+    with pytest.raises(ExistingTailError, match="shared matching/target wavevector") as info:
+        _build(
+            declaration=_declaration(ewald_beta=2.0, ewald_h=6.0),
+            matching=(4, 1, 1), target=(6, 1, 1),
+            provider=_local_provider())
+    assert "0.5" in str(info.value)
 
 
 # --------------------------------------------------------------------------

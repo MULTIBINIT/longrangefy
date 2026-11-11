@@ -57,26 +57,26 @@ This local smoke uses `/home/hexu/Downloads/2024-01-07-mace-128-L2_epoch-199.mod
 
 ## Variable-cell experiment
 
-The approved frozen correction preserves the original model's clamped-ion elastic and bilinear internal-strain response; it does **not** correct missing long-range elastic or piezoelectric physics. `VariableCellCorrectedCalculator` uses the affine ASE stress convention. One BiFeO₃ DeepMD smoke at 0.5% uniaxial strain gave a stress/energy finite-difference discrepancy of 2.5e-10 eV/Å³; this is not a supported strain range or an accuracy or NPT claim.
+The approved frozen correction preserves the original model's clamped-ion elastic and bilinear internal-strain response; it does **not** correct missing long-range elastic or piezoelectric physics. `VariableCellCorrectedCalculator` uses the affine ASE stress convention. For the owner-supplied SrTiO₃ DeepMD model, finite-difference checks at sampled normal and shear strains up to 2% gave maximum stress and force discrepancies of 8.75e-10 eV/Å³ and 4.71e-7 eV/Å. Bounded FIRE relaxations starting at 0.5–1% uniaxial strain and a separate 0.5% engineering-shear relaxation converged. These are numerical workflow checks at the recorded configurations, not a general material strain limit, accuracy claim, or NPT qualification. Evidence: `/STORAGE1/hexu/projects_bak/longrangefy/ticket09_variable_cell_20261111/` (uniaxial runs using wrapped calculator inputs) and `ticket09_unwrapped_20261111/` (current adapter).
 
 ```bash
 rtk python examples/deepmd_variable.py \
-  /STORAGE1/hexu/projects_bak/longrangefy/ticket01/real_config.json \
-  --target 2 2 4 --phi0-symmetry-tolerance 0.02375 \
-  --max-displacement 0.3 --max-strain 0.02 --strain-xx 0.005 \
-  --displace 0.02 --nreal 3 --nrecip 4
+  /STORAGE1/hexu/projects_bak/longrangefy/sto/workflow_config.json \
+  --target 2 2 4 --phi0-symmetry-tolerance 0.0001 \
+  --max-displacement 0.1 --max-strain 0.0205 --strain-xx 0.005 \
+  --displace 0.02 --nreal 7 --nrecip 10
 ```
 
-`--max-strain` is a caller-selected safety bound, not a validated material limit. The example uses unconverged Ewald settings and an in-sample IFC tolerance. Finite-strain convergence, variable-cell relaxation and NPT remain unqualified.
+`--max-strain` is a caller-selected safety bound, not a validated material limit. In the tested CPU DeepMD 3.1.3 shear trajectory, `loc idx out of ... bound` messages arose from floating-point roundoff at cell boundaries: equivalent wrapped states and an independent ASE neighbor-list path agreed within 1.1e-13 eV/Å in forces. This diagnosis is specific to the recorded states and does not dismiss warnings in other models or geometries. See `/STORAGE1/hexu/projects_bak/longrangefy/ticket09_locidx_rootcause_20261111/`.
 
 
 ## Existing explicit tails
 
-`longrangefy.existing_tail` implements the approved matching-preserving operator for explicitly declared DPLR response, including both first- and second-order Wannier-centroid response. Synthetic energy/derivative and matching checks do not qualify a real model: a compatible DPLR energy/Wannier checkpoint, response extractor, runtime-tail verification and real-model benchmark remain outstanding. Do not apply the ordinary no-tail workflow to a model with an explicit asymptotic tail.
+`longrangefy.existing_tail` implements the approved matching-preserving operator for explicitly declared DPLR response, including both first- and second-order Wannier-centroid response. Its declared existing tail reproduces the DeePMD-kit 3.1.3 **TensorFlow** `EwaldRecp` rectangular wavevector grid determined by `ewald_h`, including float32 op-attribute rounding and the runtime Coulomb constant. `CorrectedCalculator` adds the correction exactly once. Matching and target cells have independent per-axis runtime grids, so the builder compares the full existing-tail q-blocks at every shared wavevector and rejects—rather than retunes or projects—a pair whose target grid or declared Wannier response cannot preserve them. A published NaCl DPLR pair has been exercised against this runtime, but model selection, response precision and physical material accuracy remain qualification gates; do not generalize the runtime match to other DeePMD backends or versions. Do not apply the ordinary no-tail workflow to a model with an explicit asymptotic tail.
 
 
 ## Boundaries
 
-The fixed-cell geometry contract covers a fixed reference, bounded displacements, 3D PBC and diagonal repetitions of an orthogonal or skew primitive cell. Synthetic skew checks cover matching, anisotropic response, rotation covariance and Ewald convergence; they do not establish material accuracy. The ASE wrapper fixes site assignment and rejects changed cells, PBC, species and out-of-bound displacements. Corrected stress/NPT, diffusion and models with existing explicit asymptotic electrostatics are not yet supported. Initial calculator qualification is DeepMD; MACE is selected for later qualification but is not yet claimed as supported.
+The fixed-cell geometry contract covers a fixed reference, bounded displacements, 3D PBC and diagonal repetitions of an orthogonal or skew primitive cell. Synthetic skew checks cover matching, anisotropic response, rotation covariance and Ewald convergence; they do not establish material accuracy. The fixed-cell ASE wrapper fixes site assignment and rejects changed cells, PBC, species and out-of-bound displacements. Variable-cell stress is experimental under the frozen-response restrictions above; NPT, diffusion and models with existing explicit asymptotic electrostatics are not yet qualified. Initial calculator qualification is DeepMD; MACE is selected for later qualification but is not yet claimed as supported.
 
 Public lengths are Å, whole-cell energies eV, forces eV/Å, and unmassweighted IFCs eV/Å². Born indices are electric-field direction then atomic-displacement direction. Gamma uses the conducting/tin-foil boundary; directional $q\to0$ is distinct. Reuse of upstream Python routines is documented at their source; the full scientific validation and variable-cell/tail designs remain separate gates.
