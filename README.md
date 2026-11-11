@@ -44,16 +44,16 @@ Pass `--cache /path/outside/the/repo/harmonics.npz` to create reusable matching-
 
 ## MACE example
 
-The ASE adapter also has an experimental MACE workflow. Install `.[mace]`, then use the same reference, response and eligibility JSON contract:
+The ASE adapter also supports a fixed-cell workflow for the user-selected, inspected MACE checkpoint below. Install `.[mace]`, then use the same reference, response and eligibility JSON contract:
 
 ```bash
 rtk python examples/mace_matched.py \
-  /STORAGE1/hexu/projects_bak/longrangefy/mace-example/config.json \
-  --target 2 2 2 --phi0-symmetry-tolerance 0.00001 \
-  --max-displacement 0.1 --displace 0.01 --nreal 3 --nrecip 4
+  /STORAGE1/hexu/projects_bak/longrangefy/mace-real-material/inputs/config.json \
+  --target 2 2 2 --phi0-symmetry-tolerance 0.0012 \
+  --max-displacement 0.2 --displace 0.02 --nreal 5 --nrecip 8
 ```
 
-This local smoke uses `/home/hexu/Downloads/2024-01-07-mace-128-L2_epoch-199.model` (SHA-256 `514bd2f1938653c37929f7c275a489378f03a7e3ffb27aa2ae0ddce8d0c859c8`), MACE 0.3.16 on CPU and **synthetic** NaCl response tensors; it is not a material-accuracy benchmark. The inspected `ScaleShiftMACE` checkpoint uses a 6 Å neighbor cutoff and its energy consists of atomic and finite-range interaction contributions. This assessment applies only to the inspected checkpoint, not arbitrary MACE models. Load only trusted checkpoints: the installed PyTorch environment permits pickle-based loading.
+This example uses `/home/hexu/Downloads/2024-01-07-mace-128-L2_epoch-199.model` (SHA-256 `514bd2f1938653c37929f7c275a489378f03a7e3ffb27aa2ae0ddce8d0c859c8`), MACE 0.3.16 on CPU and a SrTiO₃ DFPT response; it is not a material-accuracy benchmark. The inspected `ScaleShiftMACE` checkpoint uses a 6 Å neighbor cutoff and its energy consists of atomic and finite-range interaction contributions. The user accepted this investigator assessment of its eligibility; it is not a provider declaration or a claim about arbitrary MACE models. Load only trusted checkpoints: the installed PyTorch environment permits pickle-based loading. Evidence and convergence checks are in `/STORAGE1/hexu/projects_bak/longrangefy/mace-real-material/`.
 
 ## Variable-cell experiment
 
@@ -77,6 +77,6 @@ rtk python examples/deepmd_variable.py \
 
 ## Boundaries
 
-The fixed-cell geometry contract covers a fixed reference, bounded displacements, 3D PBC and diagonal repetitions of an orthogonal or skew primitive cell. Synthetic skew checks cover matching, anisotropic response, rotation covariance and Ewald convergence; they do not establish material accuracy. The fixed-cell ASE wrapper fixes site assignment and rejects changed cells, PBC, species and out-of-bound displacements. Variable-cell stress is experimental under the frozen-response restrictions above; NPT, diffusion and models with existing explicit asymptotic electrostatics are not yet qualified. Initial calculator qualification is DeepMD; MACE is selected for later qualification but is not yet claimed as supported.
+The fixed-cell geometry contract covers a fixed reference, bounded displacements, 3D PBC and diagonal repetitions of an orthogonal or skew primitive cell. Synthetic skew checks cover matching, anisotropic response, rotation covariance and Ewald convergence; they do not establish material accuracy. The fixed-cell ASE wrapper fixes site assignment and rejects changed cells, PBC, species and out-of-bound displacements. Variable-cell stress is experimental under the frozen-response restrictions above; NPT, diffusion and models with existing explicit asymptotic electrostatics are not yet qualified. Calculator qualification covers the documented DeepMD model and, for fixed-cell energy and forces only, the inspected MACE checkpoint; it does not generalize to arbitrary models.
 
 Public lengths are Å, whole-cell energies eV, forces eV/Å, and unmassweighted IFCs eV/Å². Born indices are electric-field direction then atomic-displacement direction. Gamma uses the conducting/tin-foil boundary; directional $q\to0$ is distinct. Reuse of upstream Python routines is documented at their source; the full scientific validation and variable-cell/tail designs remain separate gates.
