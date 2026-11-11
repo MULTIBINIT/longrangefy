@@ -41,6 +41,15 @@ rtk python examples/deepmd_matched.py \
 This runs original-model finite differences when the compatible cache is absent, constructs both branches, and evaluates corrected whole-cell energy and forces through ASE. The symmetry tolerance is a caller-selected numerical bound supported by the recorded SrTiO₃ finite-difference study, not a transferable acceptance bound. Check Ewald convergence for each system and geometry before drawing conclusions. The explicitly recorded Hermitian projection of accepted finite-difference samples is visible in the output.
 Pass `--cache /path/outside/the/repo/harmonics.npz` to create reusable matching-grid data. A cache is reused only when the model SHA-256 and runtime identity, harmonic source, reference, electrical response, matching repetitions and finite-difference settings match; an incompatible cache is rejected rather than overwritten. Ewald settings apply when the correction is built and are not stored as harmonic data.
 
+The recorded SrTiO₃ harmonic phonon and frozen-distortion comparison with the upstream Gaussian correction can be reproduced using the retained, hash-checked model and DDB caches:
+
+```bash
+LR_REPRO_OUT=/STORAGE1/hexu/projects_bak/longrangefy/repro_runs/my-new-run \
+  rtk bash /STORAGE1/hexu/projects_bak/longrangefy/monacelli_comparator_20261111/reproduce.sh reuse
+```
+
+Choose a new output directory: the script refuses to overwrite one. `reuse` checks the retained inputs, recomputes the phase-aligned DDB, Gaussian and comparison tables, and writes `results/RESULTS_SUMMARY.json`; it does not regenerate the model/DFT caches. This is a harmonic-reference comparison, not a converged independent DFT accuracy benchmark. The recorded execution is in `/STORAGE1/hexu/projects_bak/longrangefy/repro_runs/readme_benchmark_20261111/`.
+
 
 ## MACE example
 
