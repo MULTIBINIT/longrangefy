@@ -173,6 +173,8 @@ Use absolute tolerances with units and relative tolerances appropriate to each s
 
 The first scientific demonstration uses DeepMD and includes phonons and larger-cell frozen-distortion energy/force comparisons. Use both a controlled reference with known response and an independently justified physical comparison. Include the original potential and an existing correction where applicable. A phonon-plot-only adjustment does not prove a corrected energy/force calculator; synthetic matching does not prove material accuracy or DeepMD integration.
 
+The user selected the existing DFPT DDB as sufficient reference for this demonstration; no additional finite-distortion DFT calculations or their convergence are required. Frozen-distortion comparisons against its harmonic IFCs assess agreement with that harmonic reference, not anharmonic first-principles accuracy. Report the DDB q mesh, interpolation, electrical boundary, and sum-rule conventions, and do not infer shared model-training provenance.
+
 ## 9. Required extensions and their boundaries
 
 ### 9.1 Variable-cell correction
