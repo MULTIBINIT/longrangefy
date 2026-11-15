@@ -10,8 +10,8 @@ Use the shared Python environment and optional DeepMD/ASE dependencies:
 
 ```bash
 source /home/hexu/projects/myenvs/mydev/bin/activate
-rtk uv pip install -e '.[ase,deepmd]'
-rtk python -m pytest tests -q
+uv pip install -e '.[ase,deepmd]'
+python -m pytest tests -q
 ```
 
 The NumPy/SciPy array core does not require ASE, DeepMD, pymultibinit or libabinit. Downstream pymultibinit integration is optional and has the opposite dependency direction.
@@ -31,11 +31,11 @@ Supply an eligible 3D-periodic insulating model, an explicit reference structure
 The owner-selected SrTiO₃ input set is at `/STORAGE1/hexu/projects_bak/longrangefy/sto/workflow_config.json`. It uses the owner's 2×2×2-trained DeepMD checkpoint and selected DDB structure and response; the owner declares that this checkpoint has no explicit electrostatic/Ewald tail. This does not establish shared model–DDB training provenance. From the project root:
 
 ```bash
-rtk python examples/deepmd_matched.py \
+python examples/deepmd_matched.py \
   /STORAGE1/hexu/projects_bak/longrangefy/sto/workflow_config.json \
   --target 2 2 4 --phi0-symmetry-tolerance 0.0001 \
   --max-displacement 0.1 --displace 0.02 --nreal 7 --nrecip 10 \
-  --cache /STORAGE1/hexu/projects_bak/longrangefy/sto/workflow_harmonics.npz
+  --cache /STORAGE1/hexu/projects_bak/longrangefy/sto/my-harmonics.npz
 ```
 
 This runs original-model finite differences when the compatible cache is absent, constructs both branches, and evaluates corrected whole-cell energy and forces through ASE. The symmetry tolerance is a caller-selected numerical bound supported by the recorded SrTiO₃ finite-difference study, not a transferable acceptance bound. Check Ewald convergence for each system and geometry before drawing conclusions. The explicitly recorded Hermitian projection of accepted finite-difference samples is visible in the output.
@@ -45,7 +45,7 @@ The recorded SrTiO₃ harmonic phonon and frozen-distortion comparison with the 
 
 ```bash
 LR_REPRO_OUT=/STORAGE1/hexu/projects_bak/longrangefy/repro_runs/my-new-run \
-  rtk bash /STORAGE1/hexu/projects_bak/longrangefy/monacelli_comparator_20261111/reproduce.sh reuse
+  bash /STORAGE1/hexu/projects_bak/longrangefy/monacelli_comparator_20261111/reproduce.sh reuse
 ```
 
 Choose a new output directory: the script refuses to overwrite one. `reuse` checks the retained inputs, recomputes the phase-aligned DDB, Gaussian and comparison tables, and writes `results/RESULTS_SUMMARY.json`; it does not regenerate the model/DFT caches. This is a harmonic-reference comparison, not a converged independent DFT accuracy benchmark. The recorded execution is in `/STORAGE1/hexu/projects_bak/longrangefy/repro_runs/readme_benchmark_20261111/`.
@@ -56,7 +56,7 @@ Choose a new output directory: the script refuses to overwrite one. `reuse` chec
 The ASE adapter also supports a fixed-cell workflow for the user-selected, inspected MACE checkpoint below. Install `.[mace]`, then use the same reference, response and eligibility JSON contract:
 
 ```bash
-rtk python examples/mace_matched.py \
+python examples/mace_matched.py \
   /STORAGE1/hexu/projects_bak/longrangefy/mace-real-material/inputs/config.json \
   --target 2 2 2 --phi0-symmetry-tolerance 0.0012 \
   --max-displacement 0.2 --displace 0.02 --nreal 5 --nrecip 8
@@ -69,7 +69,7 @@ This example uses `/home/hexu/Downloads/2024-01-07-mace-128-L2_epoch-199.model` 
 The approved frozen correction preserves the original model's clamped-ion elastic and bilinear internal-strain response; it does **not** correct missing long-range elastic or piezoelectric physics. `VariableCellCorrectedCalculator` uses the affine ASE stress convention. For the owner-supplied SrTiO₃ DeepMD model, finite-difference checks at sampled normal and shear strains up to 2% gave maximum stress and force discrepancies of 8.75e-10 eV/Å³ and 4.71e-7 eV/Å. Bounded FIRE relaxations starting at 0.5–1% uniaxial strain and a separate 0.5% engineering-shear relaxation converged. These are numerical workflow checks at the recorded configurations, not a general material strain limit, accuracy claim, or NPT qualification. Evidence: `/STORAGE1/hexu/projects_bak/longrangefy/ticket09_variable_cell_20261111/` (uniaxial runs using wrapped calculator inputs) and `ticket09_unwrapped_20261111/` (current adapter).
 
 ```bash
-rtk python examples/deepmd_variable.py \
+python examples/deepmd_variable.py \
   /STORAGE1/hexu/projects_bak/longrangefy/sto/workflow_config.json \
   --target 2 2 4 --phi0-symmetry-tolerance 0.0001 \
   --max-displacement 0.1 --max-strain 0.0205 --strain-xx 0.005 \
